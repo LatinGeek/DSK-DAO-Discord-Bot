@@ -1,38 +1,48 @@
 const { EmbedBuilder } = require("discord.js");
 const { QuickDB } = require("quick.db");
-const fs = require('fs');
-const path = require('path');
+const fs = require("fs");
+const path = require("path");
 
-const dbPath = '/usr/src/app/data/json.sqlite';
+const dbPath = "/usr/src/app/data/json.sqlite";
 
 // Add diagnostic logging
-console.log('QuickDB Initialization Check:');
-console.log('1. Directory exists:', fs.existsSync('/usr/src/app/data'));
-if (fs.existsSync('/usr/src/app/data')) {
-    console.log('2. Directory contents:', fs.readdirSync('/usr/src/app/data'));
+console.log("QuickDB Initialization Check:");
+console.log("1. Directory exists:", fs.existsSync("/usr/src/app/data"));
+if (fs.existsSync("/usr/src/app/data")) {
+  console.log("2. Directory contents:", fs.readdirSync("/usr/src/app/data"));
 }
-console.log('3. DB file exists:', fs.existsSync(dbPath));
+console.log("3. DB file exists:", fs.existsSync(dbPath));
 if (fs.existsSync(dbPath)) {
-    const stats = fs.statSync(dbPath);
-    console.log('4. DB file stats:', {
-        size: stats.size,
-        created: stats.birthtime,
-        modified: stats.mtime
-    });
+  const stats = fs.statSync(dbPath);
+  console.log("4. DB file stats:", {
+    size: stats.size,
+    created: stats.birthtime,
+    modified: stats.mtime,
+  });
 }
-
 
 const db = new QuickDB({
-  filePath: '/usr/src/app/data/json.sqlite'
+  filePath: "/usr/src/app/data/json.sqlite",
 });
 
 require("dotenv").config();
 
 const usersXp = new Set();
 
+// Define allowed channel IDs
+const allowedChannels = [
+  "987406229171208274",
+  "1342338957060477069",
+  // Add more channel IDs as needed
+];
+
 module.exports = async (client, interaction) => {
   client.on("messageCreate", async (message) => {
     if (message.author.bot) return; // Checking author for bot (if bot, return)
+
+    // Check if the message is in an allowed channel
+    if (!allowedChannels.includes(message.channel.id)) return;
+
     usersXp.add({ user: message.author.id, value: 1 }); // Adding the user XP
     let usersExperience = 0;
 

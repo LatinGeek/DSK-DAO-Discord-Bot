@@ -15,7 +15,6 @@ const farmerFeedId = "1201587003280588800";
 const ticketEarned = 2;
 const participants = 5;
 const farmerRole = "1190087733369127032";
-let autoJoin = [];
 
 async function startServer() {
   const firebaseServer = await admin.initializeApp({
@@ -24,6 +23,8 @@ async function startServer() {
 
   console.log("Starting firebase server: " + firebaseServer.options.credential.projectId);
 }
+
+
 startServer();
 
 const client = new Client({
@@ -68,6 +69,8 @@ let emojiList = [
   "🪙"
 ];
 
+let lastMessageId;
+
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 async function runWeb3Rumble(id, bot, players) {
@@ -87,29 +90,30 @@ async function runWeb3Rumble(id, bot, players) {
     })
   })
 
-  autoJoin.map((autojoined) => {
-    if (autojoined.rounds === 0) {
-      autoJoin = autoJoin.filter((user) => {
-        return user.user !== autojoined.user
-      });
-    } else {
-      // Check Active Players array
-      let activeUser = activePlayers.filter((user) => user.user === autojoined.user);
+  const database = getFirestore();
+  const userProfile = database.collection('users');
+  const autoJoinUsers = await userProfile.where('autoJoinCredits', '>', 0).get();
+
+  if (!autoJoinUsers.empty) {
+    autoJoinUsers.docs.forEach(async (user) => {
+      // Check if user is already in active players
+      let activeUser = activePlayers.filter(player => player.user === user.data().discordUserId);
       if (activeUser.length > 0) return;
 
-      // Gather player times auto-joined, then subtract one
-      let userTimes = autoJoin.filter((user) => user.user === autojoined.user);
-      let amount = userTimes[0].rounds - 1;
-      userTimes[0].rounds = amount;
-      // Add discord to the active players queue
+      // Add user to active players
       activePlayers.push({
-        user: autojoined.user,
-        username: autojoined.username,
-        image: autojoined.image,
+        user: user.data().discordUserId,
+        username: user.data().username,
+        image: user.data().image,
         autojoined: true
-      })
-    }
-  })
+      });
+
+      // Decrement their autoJoinCredits by 1
+      await user.ref.update({
+        autoJoinCredits: FieldValue.increment(-1)
+      });
+    });
+  }
 
   if (activePlayers.length < participants) {
     botV1.send({ content: `We need **${participants - activePlayers.length}** more players!\nYou can join here: https://discord.com/channels/987406227875196928/${botV1.id}/${id}` })
@@ -256,7 +260,7 @@ async function sendWinnerMessage(winner, bot, winResult, winnerImage) {
       .setColor("Yellow")
     farmerFeed.send({ embeds: [farmerWinner] })
 
-    userDetails.forEach(async (user) => {
+    userDetails.docs.forEach(async (user) => {
       const res = await user.ref.update({
         balance: FieldValue.increment(winResult ? ticketEarned : 5)
       });
@@ -280,7 +284,10 @@ async function sendWinnerMessage(winner, bot, winResult, winnerImage) {
 async function initiateGame() {
   const botV1 = client.channels.cache.get(channelId);
 
-  let messageReturn = await sendRoundMessage(botV1)
+  let messageReturn = await sendRoundMessage(botV1);
+
+  lastMessageId = messageReturn;
+  
   sendWarning(botV1, messageReturn)
   startRound(messageReturn, botV1)
 }
@@ -346,14 +353,19 @@ async function sendRoundMessage(botV1) {
     .setStyle(ButtonStyle.Primary)
     .setEmoji("🎮");
 
-  // const confirm3 = new ButtonBuilder()
-  //   .setCustomId('auto-join')
-  //   .setLabel(`Auto Join (${autoJoin?.length})`)
-  //   .setStyle(ButtonStyle.Secondary)
-  //   .setEmoji("🪙");
+  const database = getFirestore();
+  const userProfile = database.collection('users');
+  const autoJoinUsers = await userProfile.where('autoJoinCredits', '>', 0).get();
+  const autoJoinCount = autoJoinUsers.size;
+
+  const confirm3 = new ButtonBuilder()
+    .setCustomId('auto-join')
+    .setLabel(`Auto Join (${autoJoinCount})`) 
+    .setStyle(ButtonStyle.Secondary)
+    .setEmoji("🪙");
 
   const row = new ActionRowBuilder()
-    .addComponents(confirm, confirm2);
+    .addComponents(confirm, confirm2, confirm3);
 
   const embed = new EmbedBuilder()
     .setTitle(`Ticket arena started by ${client.user.username}`)
@@ -367,6 +379,7 @@ async function sendRoundMessage(botV1) {
     message.react("🛡️")
     return message.id
   })
+
 
   return message;
 }
@@ -425,7 +438,16 @@ client.on('interactionCreate', async interaction => {
     } else if (interaction.customId === "auto-join") {
       await interaction.deferReply({ ephemeral: true })
 
-      let joined = autoJoin.filter((user) => user.user === interaction.user.id)
+      const database = getFirestore();
+      const userProfile = database.collection('users');
+      const userDoc = await userProfile.where('discordUserId', '==', interaction.user.id).get();
+      let joined = [];
+      if (!userDoc.empty) {
+        const userData = userDoc.docs[0].data();
+        if (userData.autoJoinCredits > 0) {
+          joined = [{user: interaction.user.id, rounds: userData.autoJoinCredits}];
+        }
+      }
       const embed = new EmbedBuilder()
       const row = new ActionRowBuilder()
 
@@ -467,33 +489,61 @@ client.on('interactionCreate', async interaction => {
       const userDetails = await userProfile.where('discordUserId', '==', interaction.user.id).get();
       const embed = new EmbedBuilder()
 
-      if (userDetails.empty === false) {
-        let joined = autoJoin.filter((user) => user.user === interaction.user.id)
+      if (userDetails.docs.length > 0) {
 
-        if (joined.length === 1) {
+        if (userDetails.docs[0].data().autoJoinCredits > 0) {
           embed.setTitle("Auto-Join Status")
           embed.setDescription(`
-            You are currently Auto-Joining rounds. You have ${joined[0].rounds} rounds remaining.
+            You are currently Auto-Joining rounds. You have ${userDetails.docs[0].data().autoJoinCredits} rounds remaining.
           `)
           embed.setColor("Blue")
           return await interaction.editReply({ embeds: [embed], ephemeral: true })
         } else {
-          userDetails.forEach(async (user) => {
-            if (user.data().balance >= autoJoinCosts) {
+          let user = userDetails.docs[0].data();
+            if (user.balance >= autoJoinCosts) {
 
-              await user.ref.update({
-                balance: FieldValue.increment(-Number(autoJoinCosts))
-              });
-
-              autoJoin.push({
-                user: interaction.user.id,
+              await userDetails.docs[0].ref.update({
+                balance: FieldValue.increment(-Number(autoJoinCosts)),
+                autoJoinCredits: 10,
                 username: interaction.user.username,
                 image: "https://cdn.discordapp.com/avatars/" + interaction.user.id + "/" + interaction.user.avatar + ".jpeg",
-                rounds: 10,
-                autojoined: true
-              })
+              });
+              
+        // Get updated auto-join count
+        const autoJoinUsers = await userProfile.where('autoJoinCredits', '>', 0).get();
+        const autoJoinCount = autoJoinUsers.size;
 
-              embed.setTitle("Confirmed Auto-Joined")
+    // Update the button in the original message using lastMessageId
+    try {
+      const botV1 = client.channels.cache.get(channelId);
+      if (!botV1) throw new Error('Channel not found');
+
+      const originalMessage = await botV1.messages.fetch(lastMessageId);
+      if (!originalMessage?.components?.[0]) {
+        throw new Error('Original message or components not found');
+      }
+
+      const actionRow = ActionRowBuilder.from(originalMessage.components[0]);
+      const components = actionRow.components;
+
+      const updatedComponents = components.map(component => {
+        if (component.data.custom_id === 'auto-join') {
+          return ButtonBuilder.from(component)
+            .setLabel(`Auto Join (${autoJoinCount})`);
+        }
+        return ButtonBuilder.from(component);
+      });
+
+      await originalMessage.edit({
+        components: [new ActionRowBuilder().addComponents(updatedComponents)]
+      });
+
+    } catch (error) {
+      console.error('Failed to update auto-join button:', error);
+      // Continue with the response even if button update fails
+    }
+
+          embed.setTitle("Confirmed Auto-Joined")
               embed.setDescription(`
                   You have successfully auto-joined the Arena!
                 `)
@@ -511,7 +561,7 @@ client.on('interactionCreate', async interaction => {
               embed.setColor("Blue")
               return await interaction.editReply({ embeds: [embed], ephemeral: true })
             }
-          })
+          
         }
       }
     }
