@@ -1,4 +1,4 @@
-FROM node:16
+FROM node:18
 
 # Install required dependencies for better-sqlite3
 RUN apt-get update && \
@@ -8,9 +8,8 @@ RUN apt-get update && \
 
 WORKDIR /usr/src/app
 
-# Copy package files and service account
+# Copy package files
 COPY package*.json ./
-COPY service-key.json ./
 
 # Install dependencies
 RUN npm install

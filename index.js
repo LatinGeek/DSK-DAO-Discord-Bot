@@ -1,10 +1,14 @@
 require('dotenv').config();
 const { Client, IntentsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const eventHandler = require('./handlers/eventHandler');
-var serviceAccount = require("./service-key.json");
 const admin = require('firebase-admin');
 const { rando, randoSequence } = require('@nastyox/rando.js');
 const { getFirestore, Timestamp, FieldValue, initializeFirestore, doc, updateDoc } = require('firebase-admin/firestore');
+const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
+
+// Feature flags for safer deployment
+const ENABLE_RAFFLES = process.env.ENABLE_RAFFLES === 'true' || false;
+console.log(`🎫 Raffle system: ${ENABLE_RAFFLES ? 'ENABLED' : 'DISABLED'}`);
 
 const autoJoinCosts = 3;
 const roundTime = 60000 * 30;
@@ -17,15 +21,44 @@ const participants = 5;
 const farmerRole = "1190087733369127032";
 
 async function startServer() {
-  const firebaseServer = await admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  // Initialize Firebase Admin with better error handling  
+  console.log('🔥 Initializing Firebase...');
+  
+  const secretClient = new SecretManagerServiceClient();
+      
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT || 'dskdao-discord';
+  const secretPath = `projects/${projectId}/secrets/firebase-private-key`;
+  
+  
+      const [version] = await secretClient.accessSecretVersion({
+        name: `${secretPath}/versions/latest`,
+      });
+      
+      const secretValue = version.payload.data.toString();
+      const serviceAccount = JSON.parse(secretValue);
+  try {
 
-  console.log("Starting firebase server: " + firebaseServer.options.credential.projectId);
+    const firebaseServer = await admin.initializeApp({credential: admin.credential.cert(serviceAccount)});
+    console.log("🚀 Firebase server started successfully:", firebaseServer.options.credential.projectId);
+    
+  } catch (error) {
+    console.error("❌ Failed to initialize Firebase:", error.message);
+    console.error("Full error:", error);
+    
+    // Provide specific guidance based on error type
+    if (error.message.includes('DECODER routines')) {
+      console.error("🔧 DECODER ERROR GUIDANCE:");
+      console.error("- This usually means the private key format is incorrect");
+      console.error("- Check that your FIREBASE_PRIVATE_KEY has proper \\n characters");
+      console.error("- Verify the key starts with -----BEGIN PRIVATE KEY----- and ends with -----END PRIVATE KEY-----");
+      console.error("- Make sure there are no extra spaces or characters");
+    }
+    
+    process.exit(1);
+  }
 }
 
 
-startServer();
 
 const client = new Client({
   intents: [
@@ -34,18 +67,30 @@ const client = new Client({
     IntentsBitField.Flags.GuildMessages,
     IntentsBitField.Flags.MessageContent,
     IntentsBitField.Flags.GuildMessageTyping,
-    IntentsBitField.Flags.MessageContent
-  ],
+    IntentsBitField.Flags.MessageContent  ],
 });
 
-eventHandler(client);
+startServer().then(() => {
+  eventHandler(client);
+});
 
 client.on("ready", (c) => {
   console.log(`${c.user.username} is online!`)
 
   setTimeout(() => {
     initiateGame()
-  }, 5000)
+      // Start automatic raffle checking (only if enabled)
+  if (ENABLE_RAFFLES) {
+    setInterval(() => {
+      checkExpiredRaffles()
+    }, 300000) // Check every 5 minutes
+    console.log('🎫 Automatic raffle expiration checking enabled');
+  }
+  }, 50000)
+
+
+
+
 });
 
 const actions = [
@@ -386,6 +431,131 @@ async function sendRoundMessage(botV1) {
 
 client.on('interactionCreate', async interaction => {
   try {
+    // Handle raffle join buttons (only if feature enabled)
+    if (ENABLE_RAFFLES && interaction.customId && interaction.customId.startsWith('join-raffle-')) {
+      await interaction.deferReply({ ephemeral: true });
+
+      const raffleId = interaction.customId.replace('join-raffle-', '');
+      const database = getFirestore();
+      const rafflesCollection = database.collection('raffles');
+      const usersCollection = database.collection('users');
+
+      // Get the raffle document
+      const raffleDoc = await rafflesCollection.doc(raffleId).get();
+      
+      if (!raffleDoc.exists) {
+        return interaction.editReply({
+          content: '❌ This raffle no longer exists.'
+        });
+      }
+
+      const raffleData = raffleDoc.data();
+
+      // Check if raffle is active
+      if (!raffleData.active) {
+        return interaction.editReply({
+          content: '❌ This raffle is no longer active.'
+        });
+      }
+
+      // Check if raffle has ended
+      const now = new Date();
+      const endTime = raffleData.endingDateTime.toDate();
+      if (now >= endTime) {
+        return interaction.editReply({
+          content: '❌ This raffle has already ended.'
+        });
+      }
+
+      // Check if raffle is full
+      if (raffleData.ticketsSold >= raffleData.maxParticipants) {
+        return interaction.editReply({
+          content: '❌ This raffle is already full.'
+        });
+      }
+
+      // Check if user is already participating
+      if (raffleData.participants && raffleData.participants.includes(interaction.user.id)) {
+        return interaction.editReply({
+          content: '❌ You are already participating in this raffle.'
+        });
+      }
+
+      // Find user in database
+      const userQuery = await usersCollection
+        .where('discordUserId', '==', interaction.user.id)
+        .get();
+
+      if (userQuery.empty) {
+        return interaction.editReply({
+          content: '❌ You are not registered in our system. Please use the /verify command first.'
+        });
+      }
+
+      const userDoc = userQuery.docs[0];
+      const userData = userDoc.data();
+
+      // Check if user has enough balance
+      if (userData.balance < raffleData.ticketPrice) {
+        return interaction.editReply({
+          content: `❌ Insufficient balance. You need ${raffleData.ticketPrice} tickets but only have ${userData.balance} tickets.`
+        });
+      }
+
+      // Deduct ticket price from user's balance
+      await userDoc.ref.update({
+        balance: FieldValue.increment(-raffleData.ticketPrice)
+      });
+
+      // Add user to raffle participants and increment tickets sold
+      const currentParticipants = raffleData.participants || [];
+      await raffleDoc.ref.update({
+        participants: [...currentParticipants, interaction.user.id],
+        ticketsSold: FieldValue.increment(1)
+      });
+
+      // Update the raffle message with new participant count
+      try {
+        const raffleChannel = client.channels.cache.get(raffleData.channelId);
+        if (raffleChannel) {
+          const raffleMessage = await raffleChannel.messages.fetch(raffleData.messageId);
+          if (raffleMessage && raffleMessage.embeds[0]) {
+            const embed = EmbedBuilder.from(raffleMessage.embeds[0]);
+            
+            // Update the "Entries Sold" field
+            const fields = embed.data.fields;
+            const entriesSoldFieldIndex = fields.findIndex(field => field.name === '🎟️ Entries Sold');
+            if (entriesSoldFieldIndex !== -1) {
+              fields[entriesSoldFieldIndex].value = `${raffleData.ticketsSold + 1} / ${raffleData.maxParticipants}`;
+            }
+
+            await raffleMessage.edit({ embeds: [embed], components: raffleMessage.components });
+          }
+        }
+      } catch (error) {
+        console.error('Failed to update raffle message:', error);
+      }
+
+      // Send ephemeral success message (like arena game)
+      const successEmbed = new EmbedBuilder()
+        .setTitle('🎫 Raffle Entry Successful!')
+        .setDescription(`You have successfully entered the raffle: **${raffleData.title}**`)
+        .setColor('Green')
+        .addFields(
+          { name: '🎫 Cost', value: `${raffleData.ticketPrice} tickets`, inline: true },
+          { name: '💰 Remaining Balance', value: `${userData.balance - raffleData.ticketPrice} tickets`, inline: true },
+          { name: '🎯 Prize', value: raffleData.prizeTitle, inline: false }
+        )
+        .setFooter({ text: 'Good luck!' })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [successEmbed] });
+
+      console.log(`User ${interaction.user.username} (${interaction.user.id}) entered raffle ${raffleId} for ${raffleData.ticketPrice} tickets`);
+      return;
+    }
+
+    // Existing arena game interaction handlers...
     if (interaction.customId === "pool") {
       await interaction.deferReply({ ephemeral: true })
 
@@ -605,5 +775,115 @@ async function getStore() {
 module.exports = {
   getStore,
 };
+
+// Function to check and end expired raffles
+async function checkExpiredRaffles() {
+  if (!ENABLE_RAFFLES) return; // Skip if feature disabled
+  
+  try {
+    console.log('Checking for expired raffles...');
+    const database = getFirestore();
+    const rafflesCollection = database.collection('raffles');
+
+    // Get all active raffles
+    const activeRaffles = await rafflesCollection
+      .where('active', '==', true)
+      .get();
+
+    if (activeRaffles.empty) {
+      console.log('No active raffles to check.');
+      return;
+    }
+
+    const now = new Date();
+
+    for (const raffleDoc of activeRaffles.docs) {
+      const raffleData = raffleDoc.data();
+      const endTime = raffleData.endingDateTime.toDate();
+
+      // Check if raffle has expired
+      if (now >= endTime) {
+        console.log(`Raffle ${raffleDoc.id} has expired. Ending...`);
+        await endExpiredRaffle(raffleDoc.id, raffleData);
+      }
+    }
+  } catch (error) {
+    console.error('Error checking expired raffles:', error);
+  }
+}
+
+// Function to end an expired raffle
+async function endExpiredRaffle(raffleId, raffleData) {
+  try {
+    const database = getFirestore();
+    const raffleDoc = database.collection('raffles').doc(raffleId);
+
+    // Check if there are participants
+    if (!raffleData.participants || raffleData.participants.length === 0) {
+      // End raffle without winner
+      await raffleDoc.update({
+        active: false,
+        endedAt: Timestamp.now(),
+        endedBy: 'system',
+        endReason: 'expired_no_participants'
+      });
+
+      console.log(`Raffle ${raffleId} ended with no participants.`);
+      return;
+    }
+
+    // Pick random winner
+    const winnerIndex = rando(0, raffleData.participants.length - 1);
+    const winnerId = raffleData.participants[winnerIndex];
+
+    // Update raffle with winner
+    await raffleDoc.update({
+      active: false,
+      winnerUserID: winnerId,
+      endedAt: Timestamp.now(),
+      endedBy: 'system',
+      endReason: 'expired_auto'
+    });
+
+    // Update the raffle message to show winner
+    try {
+      const raffleChannel = client.channels.cache.get(raffleData.channelId);
+      if (raffleChannel) {
+        const raffleMessage = await raffleChannel.messages.fetch(raffleData.messageId);
+        if (raffleMessage) {
+          const winnerEmbed = new EmbedBuilder()
+            .setTitle('🎉 Raffle Ended!')
+            .setDescription(`**${raffleData.title}**\n⏰`)
+            .setColor('Gold')
+            .addFields(
+              { name: '🏆 Winner', value: `<@${winnerId}>`, inline: true },
+              { name: '🎯 Prize', value: raffleData.prizeTitle, inline: true },
+              { name: '👥 Total Entries', value: `${raffleData.ticketsSold}`, inline: true }
+            )
+            .setImage(raffleData.prizeImageUrl)
+            .setFooter({ text: `Raffle ID: ${raffleId} | Congratulations!` })
+            .setTimestamp();
+
+          await raffleMessage.edit({ 
+            embeds: [winnerEmbed], 
+            components: [] // Remove button
+          });
+
+          // Send winner announcement
+          await raffleChannel.send({
+            content: `🎉 **RAFFLE WINNER** 🎉\n<@${winnerId}> has won **${raffleData.prizeTitle}**!\n\nCongratulations! 🎊`
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to update raffle message:', error);
+    }
+
+    console.log(`Raffle ${raffleId} automatically ended. Winner: ${winnerId}`);
+
+  } catch (error) {
+    console.error(`Error ending expired raffle ${raffleId}:`, error);
+  }
+}
 
 client.login(process.env.TOKEN);
