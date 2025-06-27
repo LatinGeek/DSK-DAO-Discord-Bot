@@ -19,6 +19,7 @@ const farmerFeedId = "1201587003280588800";
 const ticketEarned = 2;
 const participants = 5;
 const farmerRole = "1190087733369127032";
+const raffleTicketsBurnedChannelId = "1110037295551230053"
 
 async function startServer() {
   // Initialize Firebase Admin with better error handling  
@@ -27,6 +28,13 @@ async function startServer() {
   const secretClient = new SecretManagerServiceClient();
       
   const projectId = process.env.GOOGLE_CLOUD_PROJECT || 'dskdao-discord';
+  const openaiSecretPath = `projects/${projectId}/secrets/openai-api-key`;
+  const [openaiVersion] = await secretClient.accessSecretVersion({
+    name: `${openaiSecretPath}/versions/latest`,
+  });
+
+  process.env.OPENAI_API_KEY = openaiVersion.payload.data.toString().trim();
+  console.log('✅ OpenAI API key loaded from Secret Manager');
   const secretPath = `projects/${projectId}/secrets/firebase-private-key`;
   
   
@@ -72,6 +80,7 @@ const client = new Client({
 
 startServer().then(() => {
   eventHandler(client);
+  client.login(process.env.TOKEN);
 });
 
 client.on("ready", (c) => {
@@ -86,7 +95,7 @@ client.on("ready", (c) => {
     }, 300000) // Check every 5 minutes
     console.log('🎫 Automatic raffle expiration checking enabled');
   }
-  }, 50000)
+  }, 10000)
 
 
 
@@ -439,6 +448,7 @@ client.on('interactionCreate', async interaction => {
       const database = getFirestore();
       const rafflesCollection = database.collection('raffles');
       const usersCollection = database.collection('users');
+      const serverStatsCollection = database.collection('server-stats');
 
       // Get the raffle document
       const raffleDoc = await rafflesCollection.doc(raffleId).get();
@@ -513,6 +523,31 @@ client.on('interactionCreate', async interaction => {
         participants: [...currentParticipants, interaction.user.id],
         ticketsSold: FieldValue.increment(1)
       });
+
+      //Update server stats
+      let ticketsBurnedUntilNow = 0;
+      try{
+        const serverStatsDoc = await serverStatsCollection.doc('tickets').get();
+          if (serverStatsDoc.exists) {
+            // Get current value before updating
+            const currentData = serverStatsDoc.data();
+            ticketsBurnedUntilNow = (currentData.ticketsBurned || 0) + raffleData.ticketPrice;
+            
+            await serverStatsDoc.ref.update({
+              ticketsBurned: FieldValue.increment(raffleData.ticketPrice)
+            });
+          }
+      } catch (error) {
+        console.error('Failed to update server stats:', error);
+      }
+
+      // Send a message to the raffle tickets burned channel
+      const raffleTicketsBurnedChannel = client.channels.cache.get(raffleTicketsBurnedChannelId);
+      if (raffleTicketsBurnedChannel) {
+        raffleTicketsBurnedChannel.send(`<@${interaction.user.id}> has entered the raffle: **${raffleData.title}** (#${raffleId}) for ${raffleData.ticketPrice} tickets. ${ticketsBurnedUntilNow} tickets burned until now.`);
+      }
+
+
 
       // Update the raffle message with new participant count
       try {
@@ -886,4 +921,3 @@ async function endExpiredRaffle(raffleId, raffleData) {
   }
 }
 
-client.login(process.env.TOKEN);
